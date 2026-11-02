@@ -443,7 +443,7 @@ export class S3MViewer {
     this._lodRangeScale = options.lodRangeScale ?? 1.0;
     this._unsupported = options.unsupported ?? 'warn';
     this._lodPixelRatioCap = options.lodPixelRatioCap ?? Infinity;
-    this._perTilePlacement = options.perTilePlacement === true;
+    this._perTilePlacement = options.perTilePlacement !== false;
     this._depthMode = normalizeDepthMode(options.depthMode);
     setTextureSizeCap(options.maxTextureSize ?? Infinity);
     // 运动模糊：默认关闭；开了也只在 renderFrame 里按需接管「场景→屏幕」这一步
@@ -457,6 +457,7 @@ export class S3MViewer {
     this._fallbackOffset = options.fallbackOffset;
     this._datasetManager.defaultLodTransition = this._lodTransition;
     this._datasetManager.defaultFallbackOffset = this._fallbackOffset;
+    this._datasetManager.defaultBakeMercator = options.bakeMercator;
     if (options.totalMaxTiles) {
       this._datasetManager.totalMaxTiles = options.totalMaxTiles;
     }
@@ -1715,6 +1716,13 @@ export class S3MViewer {
     // 必须在 add / updateMatrixWorld 之前设置：后者会拿当前 matrix 算 matrixWorld 并缓存
     if (this._perTilePlacement && node.sphere) {
       this._applyTilePlacement(node.group, node.sphere.center, entry);
+    } else {
+      const sceneAnchor = this.sceneAnchor;
+      if (sceneAnchor) {
+        const s = sceneAnchor.meterInMercator;
+        const center = node.sphere ? ([node.sphere.center.x, node.sphere.center.y, node.sphere.center.z] as const) : ([0, 0, 0] as const);
+        this._updateTileUniforms(node.group, center, [1.0 / s, 1.0 / s, 1.0 / s]);
+      }
     }
     entry.root.add(node.group);
     node.group.updateMatrixWorld(true);
@@ -1830,6 +1838,36 @@ export class S3MViewer {
       y: center.y,
       z: center.z,
     };
+    // 逆矩阵缓存：_toCanonicalScene 常态路径无需每次拾取反复求逆，失效点仅在瓦片放置或重锚点
+    const inv = ((group.userData as { placementInverse?: THREE.Matrix4 }).placementInverse ??= new THREE.Matrix4());
+    inv.copy(group.matrix).invert();
+
+    const sScene = sceneAnchor.meterInMercator;
+    const invScale = [1.0 / (sScene * k), 1.0 / (sScene * k), 1.0 / (sScene * k)] as const;
+    this._updateTileUniforms(group, p.pivot, invScale);
+  }
+
+  private _updateTileUniforms(
+    group: THREE.Object3D,
+    pivot: readonly [number, number, number],
+    invTileScale: readonly [number, number, number]
+  ): void {
+    group.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (((mesh as any).isMesh || (mesh as any).isPoints) && mesh.material) {
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        for (const m of mats) {
+          const uPivot = (m as any).userData?.uTilePivot;
+          const uScale = (m as any).userData?.uInvTileScale;
+          if (uPivot?.value) {
+            uPivot.value.set(pivot[0], pivot[1], pivot[2]);
+          }
+          if (uScale?.value) {
+            uScale.value.set(invTileScale[0], invTileScale[1], invTileScale[2]);
+          }
+        }
+      }
+    });
   }
 
   /**
@@ -1864,7 +1902,7 @@ export class S3MViewer {
     return p
       .clone()
       .sub(root.position)
-      .applyMatrix4(_tilePlacementInverse.copy(group.matrix).invert())
+      .applyMatrix4((group.userData as { placementInverse?: THREE.Matrix4 }).placementInverse ?? _tilePlacementInverse.copy(group.matrix).invert())
       .add(root.position);
   }
 

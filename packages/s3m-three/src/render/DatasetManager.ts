@@ -55,6 +55,7 @@ export interface S3MDatasetOptions {
    * 只影响该数据集**之后创建**的材质。
    */
   materialQuality?: 'pbr' | 'lambert';
+  bakeMercator?: boolean;
   /**
    * 是否对该数据集生成几何棱线（CPU 端 EdgesGeometry）。
    * - 不填：跟随全局 `style.edges`
@@ -119,6 +120,7 @@ export class DatasetManager {
   defaultMaterialQuality: 'pbr' | 'lambert' | undefined = undefined;
   defaultLodTransition: 'binary' | 'incremental' = 'binary';
   defaultFallbackOffset?: { factor?: number; units?: number };
+  defaultBakeMercator?: boolean;
 
   setDefaultLodTransition(mode: 'binary' | 'incremental'): void {
     this.defaultLodTransition = mode;
@@ -296,6 +298,7 @@ export class DatasetManager {
       colorPipeline: this.defaultColorPipeline,
       textureOptions: this.defaultTextureOptions,
       useWorker: ds.useWorker,
+      bakeMercator: ds.bakeMercator ?? this.defaultBakeMercator,
       authenticate: ds.authenticate ?? authenticate,
       unsupported: ds.unsupported,
       uniforms: uniforms,
