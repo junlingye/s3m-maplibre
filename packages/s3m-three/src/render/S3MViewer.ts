@@ -27,8 +27,10 @@ import { createDatasetUniforms } from './DatasetStyle.js';
 import type { BuildTileFn, TileNode, TileVisibilityTest } from '../tileset/S3MTileset.js';
 import type { AuthenticateFn } from '../core/AuthFetch.js';
 import { setSplatViewport } from './GeometryBuilder.js';
-import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap } from './TextureFactory.js';
+import { setMaxAnisotropy, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap } from './TextureFactory.js';
 import type { TextureCreateOptions } from './TextureFactory.js';
+import { resolveBackend } from './gpuBackend.js';
+import type { GpuBackend, WebGLRendererInit } from './gpuBackend.js';
 import { getMaterialQuality, normalizeMaterialQuality, getColorPipeline, normalizeColorPipeline } from './StyleMaterial.js';
 import type { LightingPreset } from './lightingPreset.js';
 import { LightRig } from './viewer/LightRig.js';
@@ -214,6 +216,11 @@ export class S3MViewer {
   /** 宿主画布与 WebGL 上下文，mount() 时绑定 */
   canvas: HTMLCanvasElement | null = null;
   renderer: THREE.WebGLRenderer | null = null;
+  /**
+   * 当前挂载所用的 GPU 后端（#49 第 1 步）。裸 gl 会被包成 `WebGLBackend`。
+   * 后续步骤（异步回读、监听失效）经由它扩展，不在 viewer 里直接判 `renderer` 类型。
+   */
+  private _backend: GpuBackend | null = null;
   scene: THREE.Scene | null = null;
   camera: THREE.Camera | null = null;
   picker: Picker | null = null;
@@ -738,33 +745,24 @@ export class S3MViewer {
    * 绑定宿主画布与 WebGL 上下文，建场景并启动数据集队列。
    * MapLibre 宿主由 S3MLayer 在 onAdd 里调用；纯 three 宿主直接传自己的 canvas / gl。
    */
-  /** 创建并配置一个绑定到给定 gl 上下文的 three renderer（mount 与上下文恢复共用） */
-  private _createRenderer(canvas: HTMLCanvasElement, gl: WebGLRenderingContext | WebGL2RenderingContext): THREE.WebGLRenderer {    const r = new THREE.WebGLRenderer({
-      canvas,
-      context: gl as WebGLRenderingContext,
-      antialias: true,
-    });
-    r.autoClear = false;
-    r.setPixelRatio(1);
-    // 允许外部传入色调映射模式，默认使用 THREE.NoToneMapping 还原真实材质与底图通透度，避免 ACESFilmic 压暗阴影与偏色
-    r.toneMapping = this.options.toneMapping !== undefined ? this.options.toneMapping : THREE.NoToneMapping;
-    r.toneMappingExposure = this.options.toneMappingExposure ?? 1.0;
-    return r;
+  /**
+   * 从 viewer 选项投影出建 renderer 用的调节项，交给 `GpuBackend`。
+   * 色调映射 / 曝光是逐 viewer 的，后端只负责按这些值配置自己造的 renderer。
+   */
+  private _rendererInit(): WebGLRendererInit {
+    return { toneMapping: this.options.toneMapping, toneMappingExposure: this.options.toneMappingExposure };
   }
 
-  /** 按 GL 能力开/关 DXT 压缩直传：两个 s3tc 扩展都要在（srgb 缺了贴图会发白失配） */
-  private _syncTextureCapabilities(gl: WebGLRenderingContext | WebGL2RenderingContext): void {
-    const s3tc = !!gl.getExtension('WEBGL_compressed_texture_s3tc');
-    const s3tcSrgb = !!gl.getExtension('WEBGL_compressed_texture_s3tc_srgb');
-    setCompressedTexturesSupported(s3tc && s3tcSrgb);
-  }
-
-  mount(canvas: HTMLCanvasElement, gl: WebGLRenderingContext | WebGL2RenderingContext): void {
+  mount(canvas: HTMLCanvasElement, glOrBackend: WebGLRenderingContext | WebGL2RenderingContext | GpuBackend): void {
     this.canvas = canvas;
 
-    this.renderer = this._createRenderer(canvas, gl);
+    // 裸 WebGL 上下文（旧调用路径）会被包成 WebGLBackend，行为与改造前逐字一致；
+    // 传了显式 backend 则用它（#49 第 1 步的后端接缝，WebGPU 后端在后续步骤落地）。
+    const backend = resolveBackend(glOrBackend, this._rendererInit());
+    this._backend = backend;
+    this.renderer = backend.createRenderer(canvas);
     setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy(), this.options.anisotropyCap ?? Infinity);
-    this._syncTextureCapabilities(gl);
+    backend.syncTextureCapabilities();
     // 裁剪是构造期就能设的（还没 mount 时 `_applyClipping` 会先跳过），这里补挂一次
     this._analysis.applyClipping();
 
@@ -797,7 +795,7 @@ export class S3MViewer {
    * 绑在新 gl 上的新实例，下一帧渲染时 three 会自动把现存的几何体、材质、纹理
    * 重新上传到新上下文 —— 不需要重建场景，也不需要重新拉瓦片。
    */
-  restoreContext(gl: WebGLRenderingContext | WebGL2RenderingContext): void {
+  restoreContext(glOrBackend: WebGLRenderingContext | WebGL2RenderingContext | GpuBackend): void {
     if (!this.canvas) {
       // 理论不会走到：没 mount 过就没有上下文可恢复
       console.warn('[s3m] restoreContext 调用过早（尚未 mount），按首次挂载处理');
@@ -809,9 +807,11 @@ export class S3MViewer {
     } catch {
       /* noop */
     }
-    this.renderer = this._createRenderer(this.canvas, gl);
+    const backend = resolveBackend(glOrBackend, this._rendererInit());
+    this._backend = backend;
+    this.renderer = backend.createRenderer(this.canvas);
     setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy(), this.options.anisotropyCap ?? Infinity);
-    this._syncTextureCapabilities(gl);
+    backend.syncTextureCapabilities();
     // 新 renderer 的 clippingPlanes 是空的，裁剪状态要重新挂上去
     this._analysis.applyClipping();
     this.picker?.dispose();
@@ -853,6 +853,7 @@ export class S3MViewer {
 
     this.renderer?.dispose?.();
     this.renderer = null;
+    this._backend = null;
     this.canvas = null;
   }
 

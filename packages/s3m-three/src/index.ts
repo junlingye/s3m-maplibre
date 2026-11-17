@@ -100,6 +100,9 @@ export type {
 } from './render/S3MViewer.js';
 export { HostRenderer } from './render/HostRenderer.js';
 export type { HostRendererOptions, HostFrame } from './render/HostRenderer.js';
+// 后端抽象（#49 第 1 步）：宿主可传裸 WebGL 上下文（旧路径），也可实现 GpuBackend 接入其它后端
+export { WebGLBackend, resolveBackend } from './render/gpuBackend.js';
+export type { GpuBackend, GpuBackendKind, WebGLRendererInit } from './render/gpuBackend.js';
 export {
   DEFAULT_STYLE,
   STYLE,

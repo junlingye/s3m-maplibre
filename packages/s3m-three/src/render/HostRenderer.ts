@@ -20,6 +20,7 @@
  */
 import { S3MViewer } from './S3MViewer.js';
 import type { S3MViewerOptions, PickResult } from './S3MViewer.js';
+import type { GpuBackend } from './gpuBackend.js';
 import type { ProjectionMode } from './OrthoProjection.js';
 import type { TransitionOptions } from '../anim/Animator.js';
 import type { Stats } from '../core/types.js';
@@ -156,15 +157,21 @@ export abstract class HostRenderer {
 
   /* ----------------------------------------------------------------- 生命周期 */
 
-  /** 挂载渲染内核到宿主的 canvas + 共享 GL 上下文（上下文恢复时原地换新 renderer） */
-  protected mountViewer(canvas: HTMLCanvasElement, gl: WebGLRenderingContext | WebGL2RenderingContext): void {
+  /**
+   * 挂载渲染内核到宿主：canvas + 裸 WebGL 上下文（旧调用路径）或显式 `GpuBackend`（#49 第 1 步）。
+   * 上下文恢复时原地换新 renderer，保留已加载的瓦片。
+   */
+  protected mountViewer(
+    canvas: HTMLCanvasElement,
+    glOrBackend: WebGLRenderingContext | WebGL2RenderingContext | GpuBackend,
+  ): void {
     const entry = HostRenderer._mounts.get(this.viewer);
 
     if (entry) {
       if (entry.owner === this) {
         // 上下文恢复路径：onAdd 被再次触发（map.addLayer），原地换新 renderer，
         // 保留已加载的场景与瓦片，不重建、不重拉。
-        this.viewer.restoreContext(gl);
+        this.viewer.restoreContext(glOrBackend);
         return;
       }
       // 另一个图层已经挂上了这个共享内核：直接复用，既不 mount 也不 restore
@@ -180,13 +187,13 @@ export abstract class HostRenderer {
     if (this.viewer.renderer) {
       // 兜底：内核已被挂载过但没走这条登记（如外部直接替换了 viewer 实例）。
       // 维持旧语义 —— 有 renderer 就走上下文恢复，而不是重复 mount。
-      this.viewer.restoreContext(gl);
+      this.viewer.restoreContext(glOrBackend);
       HostRenderer._mounts.set(this.viewer, { owner: this, refs: 1 });
       this._viewerMounted = true;
       return;
     }
 
-    this.viewer.mount(canvas, gl);
+    this.viewer.mount(canvas, glOrBackend);
     HostRenderer._mounts.set(this.viewer, { owner: this, refs: 1 });
     this._viewerMounted = true;
   }
